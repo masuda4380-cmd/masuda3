@@ -1,0 +1,408 @@
+<!--
+  Updated webcam app with recording functionality and JPEG snapshot
+  This version adds recording buttons (start/stop) and uses MediaRecorder
+  to record the filtered video along with audio. It attempts to record
+  in MP4 (H.264/AAC) if the browser supports it, otherwise falls back
+  to WebM. Snapshots are saved as JPEG (.jpg). The UI still provides
+  filters, mirror toggle, ASCII art, and pixelation. The two panels
+  (video preview and processed canvas) are displayed side by side.
+-->
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web カメラ フィルタ &amp; 録画 &amp; スナップショット</title>
+  <style>
+    /* 基本的なスタイル設定 */
+    body {
+      font-family: sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f2f2f2;
+      color: #333;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 {
+      margin-top: 1rem;
+      font-size: 1.6rem;
+      text-align: center;
+    }
+    #video-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-top: 1rem;
+      max-width: 1200px;
+      width: 100%;
+      justify-content: center;
+    }
+    video, canvas {
+      /* 動画とキャンバスを横並びで50%ずつ表示 */
+      flex: 1 1 45%;
+      max-width: 45%;
+      height: auto;
+      border-radius: 4px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    }
+    /* ASCII 表示用 */
+    #asciiContainer {
+      white-space: pre;
+      font-family: monospace;
+      line-height: 6px;
+      font-size: 6px;
+      color: #222;
+      margin-top: 1rem;
+      display: none;
+      width: 100%;
+      overflow-wrap: break-word;
+    }
+    #controls {
+      margin-top: 1rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      justify-content: center;
+    }
+    #controls button, #controls select {
+      padding: 0.5rem 1rem;
+      font-size: 0.9rem;
+      border: 1px solid #ccc;
+      border-radius: 3px;
+      cursor: pointer;
+      background-color: #fff;
+    }
+    #controls button:hover, #controls select:hover {
+      background-color: #f0f0f0;
+    }
+    #recordings {
+      margin-top: 1rem;
+      width: 100%;
+      max-width: 800px;
+    }
+    #recordings video {
+      display: block;
+      width: 100%;
+      margin-top: 0.5rem;
+      border-radius: 4px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    }
+    #recordings a {
+      display: inline-block;
+      margin-top: 0.25rem;
+      color: #007BFF;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <h1>Web カメラ フィルタ &amp; 録画 &amp; スナップショット</h1>
+
+  <div id="video-container">
+    <!-- カメラの映像を表示する video 要素
+         muted 属性を付けることで録画前のプレビューから音声が出ないようにする -->
+    <video id="video" autoplay playsinline muted></video>
+    <!-- フィルタ処理後の映像を描画する canvas 要素 -->
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <!-- ASCII アート表示領域 -->
+  <pre id="asciiContainer"></pre>
+
+  <div id="controls">
+    <label for="filterSelect">フィルタ:</label>
+    <select id="filterSelect">
+      <option value="none">なし</option>
+      <option value="grayscale">グレースケール</option>
+      <option value="sepia">セピア</option>
+      <option value="invert">反転</option>
+      <option value="pixelate">ピクセル化</option>
+      <option value="ascii">ASCIIアート</option>
+    </select>
+    <button id="mirrorBtn">ミラー</button>
+    <button id="snapBtn">スナップショット</button>
+    <button id="recordBtn">録画開始</button>
+    <button id="stopBtn" disabled>録画停止</button>
+    <button id="asciiToggleBtn">ASCII 表示切替</button>
+  </div>
+
+  <!-- 録画した動画とダウンロードリンクを表示 -->
+  <div id="recordings"></div>
+
+  <script>
+    (function() {
+      const video = document.getElementById('video');
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const asciiContainer = document.getElementById('asciiContainer');
+      const filterSelect = document.getElementById('filterSelect');
+      const mirrorBtn = document.getElementById('mirrorBtn');
+      const snapBtn = document.getElementById('snapBtn');
+      const asciiToggleBtn = document.getElementById('asciiToggleBtn');
+      const recordBtn = document.getElementById('recordBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const recordings = document.getElementById('recordings');
+
+      let mirror = false;
+      let asciiMode = false;
+      // 使用する文字一覧（輝度が低い順）
+      const asciiChars = [' ', '.', ',', ':', ';', 'i', '1', 't', 'f', 'L', 'C', 'G', '0', '8', '@'];
+
+      // 一時的なオフスクリーン canvas（ピクセル化や ASCII 変換に利用）
+      const offCanvas = document.createElement('canvas');
+      const offCtx = offCanvas.getContext('2d');
+
+      // 録画関連
+      let mediaRecorder = null;
+      let recordingMimeType = '';
+      let chunks = [];
+
+      // カメラ映像の取得
+      async function startCamera() {
+        try {
+          // カメラアクセス要求。ユーザーが許可すると MediaStream が返る【335815398087750†L203-L207】
+          // オーディオにエコーキャンセル・ノイズ抑制・自動ゲインを指定して取得
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user' },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+          video.srcObject = stream;
+          await video.play();
+          // プレビュー時は音声を出さないようにミュートする
+          video.muted = true;
+          // video のサイズが読み込まれたら canvas サイズを設定
+          video.addEventListener('loadedmetadata', () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          });
+          // 描画ループ開始
+          requestAnimationFrame(drawFrame);
+        } catch (err) {
+          alert('カメラへのアクセスに失敗しました: ' + err);
+        }
+      }
+
+      // フィルタ処理関数
+      function applyPixelFilter(imageData, type) {
+        const data = imageData.data;
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          if (type === 'grayscale') {
+            // 輝度の重み付け平均【244045023616205†L392-L394】
+            const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+            data[i] = data[i + 1] = data[i + 2] = gray;
+          } else if (type === 'sepia') {
+            // セピア変換【244045023616205†L454-L467】
+            const newR = 0.393 * r + 0.769 * g + 0.189 * b;
+            const newG = 0.349 * r + 0.686 * g + 0.168 * b;
+            const newB = 0.272 * r + 0.534 * g + 0.131 * b;
+            data[i]     = newR > 255 ? 255 : newR;
+            data[i + 1] = newG > 255 ? 255 : newG;
+            data[i + 2] = newB > 255 ? 255 : newB;
+          } else if (type === 'invert') {
+            // 色を反転【244045023616205†L429-L439】
+            data[i]     = 255 - r;
+            data[i + 1] = 255 - g;
+            data[i + 2] = 255 - b;
+          }
+          // 透明度はそのまま
+        }
+        return imageData;
+      }
+
+      // ピクセル化処理
+      function drawPixelated(srcVideo) {
+        const pixelSize = 10; // ピクセルブロックのサイズ
+        // オフスクリーンキャンバスに縮小描画
+        offCanvas.width = Math.ceil(canvas.width / pixelSize);
+        offCanvas.height = Math.ceil(canvas.height / pixelSize);
+        offCtx.drawImage(srcVideo, 0, 0, offCanvas.width, offCanvas.height);
+        // メインキャンバスへ拡大描画（補間無効）
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(offCanvas, 0, 0, offCanvas.width, offCanvas.height, 0, 0, canvas.width, canvas.height);
+        ctx.imageSmoothingEnabled = true;
+      }
+
+      // ASCII アート変換
+      function drawAscii(srcVideo) {
+        // ASCII 用に縮小
+        const cols = 80; // 横方向の文字数
+        const rows = Math.round(cols * (canvas.height / canvas.width));
+        offCanvas.width = cols;
+        offCanvas.height = rows;
+        offCtx.drawImage(srcVideo, 0, 0, cols, rows);
+        const imgData = offCtx.getImageData(0, 0, cols, rows);
+        let asciiString = '';
+        for (let y = 0; y < rows; y++) {
+          for (let x = 0; x < cols; x++) {
+            const index = (y * cols + x) * 4;
+            const r = imgData.data[index];
+            const g = imgData.data[index + 1];
+            const b = imgData.data[index + 2];
+            // 輝度計算式。MDN の重み付け平均を利用【244045023616205†L392-L394】
+            const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+            const charIndex = Math.floor(brightness * (asciiChars.length - 1));
+            asciiString += asciiChars[charIndex];
+          }
+          asciiString += '\n';
+        }
+        asciiContainer.textContent = asciiString;
+      }
+
+      // 描画ループ
+      function drawFrame() {
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          // canvas サイズが video に合わせて決まっていることを確認
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
+          // キャンバスをクリアしてから描画【335815398087750†L203-L207】
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          // ミラー処理
+          ctx.save();
+          if (mirror) {
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+          }
+          const currentFilter = filterSelect.value;
+          if (currentFilter === 'pixelate') {
+            drawPixelated(video);
+          } else if (currentFilter === 'ascii') {
+            // ASCII モードは別途 ASCII 用コンテナに出力するため canvas は通常描画
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            drawAscii(video);
+          } else {
+            // フィルタ無効なら通常描画
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            if (currentFilter !== 'none') {
+              // ピクセル操作用の ImageData を取得
+              let frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              frame = applyPixelFilter(frame, currentFilter);
+              ctx.putImageData(frame, 0, 0);
+            }
+          }
+          ctx.restore();
+        }
+        requestAnimationFrame(drawFrame);
+      }
+
+      // ミラーボタン切替
+      mirrorBtn.addEventListener('click', () => {
+        mirror = !mirror;
+        mirrorBtn.textContent = mirror ? 'ミラー解除' : 'ミラー';
+      });
+
+      // スナップショット：現在の canvas を JPEG として保存【362642359712971†L187-L198】
+      snapBtn.addEventListener('click', () => {
+        const dataURL = canvas.toDataURL('image/jpeg', 0.92); // JPEG 形式で取得
+        const link = document.createElement('a');
+        link.href = dataURL;
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        link.download = `snapshot-${timestamp}.jpg`;
+        link.click();
+      });
+
+      // ASCII 表示切替
+      asciiToggleBtn.addEventListener('click', () => {
+        asciiMode = !asciiMode;
+        asciiContainer.style.display = asciiMode ? 'block' : 'none';
+        asciiToggleBtn.textContent = asciiMode ? 'ASCII 非表示' : 'ASCII 表示切替';
+      });
+
+      // 録画開始
+      recordBtn.addEventListener('click', () => {
+        if (mediaRecorder) return; // 録画中は無視
+        // canvas を30fpsでキャプチャ
+        const canvasStream = canvas.captureStream(30);
+        const srcStream = video.srcObject;
+        // オリジナルのストリームから音声トラックを取得
+        const audioTracks = srcStream ? srcStream.getAudioTracks() : [];
+        // 映像と音声の両方を持つ MediaStream を生成
+        const combinedStream = new MediaStream([
+          ...canvasStream.getVideoTracks(),
+          ...audioTracks
+        ]);
+        // 対応する mimeType を決定
+        let options = {};
+        let selectedMime = '';
+        // 優先順位の高い順にサポートを確認。MP4 で音声込みのコーデックを優先する
+        const preferredTypes = [
+          'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+          'video/mp4;codecs=avc1,mp4a.40.2',
+          'video/mp4;codecs=avc1',
+          'video/mp4',
+          'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
+          'video/webm'
+        ];
+        for (const type of preferredTypes) {
+          if (MediaRecorder.isTypeSupported(type)) {
+            selectedMime = type;
+            break;
+          }
+        }
+        options.mimeType = selectedMime;
+        // ビットレートを設定して画質と音質を確保
+        options.audioBitsPerSecond = 256000;
+        options.videoBitsPerSecond = 2000000;
+        try {
+          mediaRecorder = new MediaRecorder(combinedStream, options);
+          recordingMimeType = selectedMime;
+        } catch (e) {
+          alert('MediaRecorder の初期化に失敗しました: ' + e);
+          return;
+        }
+        chunks = [];
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            chunks.push(e.data);
+          }
+        };
+        mediaRecorder.onstop = () => {
+          const blob = new Blob(chunks, { type: recordingMimeType });
+          const url = URL.createObjectURL(blob);
+          // 動画要素とダウンロードリンクを作成
+          const vid = document.createElement('video');
+          vid.src = url;
+          vid.controls = true;
+          const a = document.createElement('a');
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const ext = recordingMimeType.includes('mp4') ? 'mp4' : 'webm';
+          a.href = url;
+          a.download = `recording-${timestamp}.${ext}`;
+          a.textContent = `録画をダウンロード (${ext})`;
+          recordings.appendChild(vid);
+          recordings.appendChild(a);
+          recordings.appendChild(document.createElement('hr'));
+          mediaRecorder = null;
+          recordBtn.disabled = false;
+          stopBtn.disabled = true;
+        };
+        mediaRecorder.start();
+        recordBtn.disabled = true;
+        stopBtn.disabled = false;
+      });
+
+      // 録画停止
+      stopBtn.addEventListener('click', () => {
+        if (!mediaRecorder) return;
+        mediaRecorder.stop();
+      });
+
+      // 初期化
+      startCamera();
+    })();
+  </script>
+</body>
+</html>
